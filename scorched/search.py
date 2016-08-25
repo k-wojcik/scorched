@@ -604,33 +604,72 @@ class SolrSearch(BaseSearch):
         return ret
 
     def cursor(self, constructor=None, rows=None):
-        if self.paginator.start is not None:
-            raise ValueError(
-                "cannot use the start parameter and cursors at the same time")
         search = self
+        config = {} 
         if rows:
-            search = search.paginate(rows=rows)
-        return SolrCursor(search, constructor)
+            config['rows'] = rows
+        else:
+            config['rows'] = self.paginator.rows
+            
+        return SolrCursor(search, constructor, config)
 
 
 class SolrCursor:
-    def __init__(self, search, constructor):
+    def __init__(self, search, constructor, config):
         self.search = search
         self.constructor = constructor
+        self.cursor_mark = "*"
+        self.numFound = None
+        self.itemsToSkip = 0
+        self.itemsToReturn = None
+        
+        if search.paginator.start is not None:
+            self.itemsToSkip = search.paginator.start
+            search.paginator.start = 0
+           
+        if search.paginator.rows is not None:
+            self.itemsToReturn = search.paginator.rows
+            
+        self.search = self.search.paginate(rows=config['rows'])
+            
+    def __len__(self):
+        if self.numFound is None:
+            self.numFound = len()
+        return self.numFound
 
+    def len(self):
+         options = self.search.options()
+         options['cursorMark'] = '*'
+         ret = self.search.interface.search(**options)
+         self.numFound = ret.result.numFound
+  
+    def fetchall(self):
+        return list(self)
+  
     def __iter__(self):
-        cursor_mark = "*"
         while True:
             options = self.search.options()
-            options['cursorMark'] = cursor_mark
+            options['cursorMark'] = self.cursor_mark
             ret = self.search.interface.search(**options)
+            self.numFound = ret.result.numFound
+            
             if self.constructor:
                 ret = self.search.constructor(ret, self.constructor)
             for item in ret:
+                if self.itemsToSkip > 0:
+                    self.itemsToSkip -= 1
+                    continue
+                    
+                if self.itemsToReturn is not None:
+                    if self.itemsToReturn == 0:
+                        break
+                    else:
+                        self.itemsToReturn -= 1
+                        
                 yield item
-            if ret.next_cursor_mark == cursor_mark:
+            if ret.next_cursor_mark == self.cursor_mark or self.itemsToReturn == 0:
                 break
-            cursor_mark = ret.next_cursor_mark
+            self.cursor_mark = ret.next_cursor_mark
 
 
 class MltSolrSearch(BaseSearch):
