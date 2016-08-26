@@ -603,35 +603,30 @@ class SolrSearch(BaseSearch):
             ret = self.constructor(ret, constructor)
         return ret
 
-    def cursor(self, constructor=None, rows=None):
+    def cursor(self, constructor=None, rows=None, cache=None):
         search = self
         config = {} 
         if rows:
-            config['rows'] = rows
+            config['cursor_size'] = rows
         else:
-            config['rows'] = self.paginator.rows
+            config['cursor_size'] = self.paginator.rows
             
-        return SolrCursor(search, constructor, config)
+        if self.paginator.start is not None or self.paginator.rows is not None:
+            return SolrCursorPagination(search, constructor, config, SolrCursorCache(cache))
+        else:
+            return SolrCursor(search, constructor, config)
 
 
-class SolrCursor:
+class SolrCursor(object):
     def __init__(self, search, constructor, config):
         self.search = search
         self.constructor = constructor
-        self.cursor_mark = "*"
+        self.config = config
         self.numFound = None
-        self.itemsToSkip = 0
-        self.itemsToReturn = None
+        self.cursor_mark_list = {}
+        self.current_cursor_mark = { 'cursor_mark': '*', 'page': 0}
+        self.cursor_mark_list[self.current_cursor_mark['page']] = self.current_cursor_mark['cursor_mark']
         
-        if search.paginator.start is not None:
-            self.itemsToSkip = search.paginator.start
-            search.paginator.start = 0
-           
-        if search.paginator.rows is not None:
-            self.itemsToReturn = search.paginator.rows
-            
-        self.search = self.search.paginate(rows=config['rows'])
-            
     def __len__(self):
         if self.numFound is None:
             self.numFound = len()
@@ -640,6 +635,8 @@ class SolrCursor:
     def len(self):
          options = self.search.options()
          options['cursorMark'] = '*'
+         options['rows'] = 0
+         options['start'] = 0
          ret = self.search.interface.search(**options)
          self.numFound = ret.result.numFound
   
@@ -649,29 +646,109 @@ class SolrCursor:
     def __iter__(self):
         while True:
             options = self.search.options()
-            options['cursorMark'] = self.cursor_mark
+            options['start'] = 0
+            options['rows'] = self.config['cursor_size']
+            options['cursorMark'] = self.current_cursor_mark['cursor_mark']
             ret = self.search.interface.search(**options)
             self.numFound = ret.result.numFound
+            
+            if ret.next_cursor_mark != self.current_cursor_mark['cursor_mark']:
+                self.cursor_mark_list[self.current_cursor_mark['page'] + 1] = ret.next_cursor_mark
             
             if self.constructor:
                 ret = self.search.constructor(ret, self.constructor)
             for item in ret:
-                if self.itemsToSkip > 0:
-                    self.itemsToSkip -= 1
-                    continue
-                    
-                if self.itemsToReturn is not None:
-                    if self.itemsToReturn == 0:
-                        break
-                    else:
-                        self.itemsToReturn -= 1
-                        
                 yield item
-            if ret.next_cursor_mark == self.cursor_mark or self.itemsToReturn == 0:
+            if ret.next_cursor_mark == self.current_cursor_mark['cursor_mark']:
                 break
-            self.cursor_mark = ret.next_cursor_mark
+            self.current_cursor_mark['cursor_mark'] = ret.next_cursor_mark
+            self.current_cursor_mark['page'] += 1
+            
 
-
+class SolrCursorPagination(SolrCursor):
+    def __init__(self, search, constructor, config, cache):
+        super(SolrCursorPagination, self).__init__(search, constructor, config)
+        self.itemsToSkip = 0
+        self.itemsToReturn = None
+        self.cache = cache
+        
+        if search.paginator.start is not None:
+            self.itemsToSkip = search.paginator.start
+           
+        if search.paginator.rows is not None:
+            self.itemsToReturn = search.paginator.rows
+        
+        self.selectedPage = (search.paginator.start or 0) / self.config['cursor_size']
+        self.options_hash = self.compute_option_hash()
+        
+        if self.cache.exists(self.options_hash):
+            self.cursor_mark_list = self.cache.get(self.options_hash)
+            self.current_cursor_mark = self.get_cursor_mark_for_page(self.selectedPage)
+            self.itemsToSkip -= self.current_cursor_mark['page'] * self.config['cursor_size']
+    
+    def compute_option_hash(self):
+        options = self.search.options()
+        options['start'] = 0
+        return hash(str(options))
+    
+    def get_cursor_mark_for_page(self, page):
+        if page in self.cursor_mark_list:
+            return { 'cursor_mark': self.cursor_mark_list[page], 'page': page}  
+        elif len(self.cursor_mark_list) > 0:
+            return { 'cursor_mark': self.cursor_mark_list[len(self.cursor_mark_list)-1], 'page': len(self.cursor_mark_list)-1}
+        else:
+            return { 'cursor_mark': '*', 'page': 0}
+            
+    def __iter__(self):
+        for item in super(SolrCursorPagination, self).__iter__():
+            if self.itemsToSkip > 0:
+                self.itemsToSkip -= 1
+                continue
+                
+            if self.itemsToReturn is not None:
+                self.itemsToReturn -= 1
+                    
+            yield item
+            
+            if self.itemsToReturn == 0:
+                break
+                        
+        self.cache.update(self.options_hash, self.cursor_mark_list)
+        
+class SolrCursorCache:
+    def __init__(self, cache_object=None):
+        try:
+            from cachetools import LRUCache
+        except ImportError:
+            raise ImportError('cachetools package is required')
+    
+        self.cache = cache_object
+        
+    def update(self, key, item):
+        if self.cache is not None:
+            self.cache[key] = item
+    
+    def get(self, key):
+        if self.cache is not None:
+            return self.cache[key]
+        else:
+            return None
+    
+    def exists(self, key):
+        if self.cache is not None:
+            return key in self.cache
+        else: 
+            return False
+            
+    def get_update(self, key, item):
+        if self.exists(key):
+            return self.get(key)
+        else:
+            self.update(key, item)
+            
+        return item    
+            
+            
 class MltSolrSearch(BaseSearch):
 
     """Manage parameters to build a MoreLikeThisHandler query"""
